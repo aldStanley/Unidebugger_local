@@ -181,7 +181,126 @@ def testing(root_test_dir: str, container)-> int: # return the number of failing
         print("@"*50)
         exit()
     
+def _find_gradle() -> str:
+    wrapper_dists = os.path.expanduser("~/.gradle/wrapper/dists")
+    if not os.path.isdir(wrapper_dists):
+        raise FileNotFoundError("~/.gradle/wrapper/dists not found")
+    for dist_name in sorted(os.listdir(wrapper_dists), reverse=True):
+        if not (dist_name.startswith("gradle-8") or dist_name.startswith("gradle-7")):
+            continue
+        for hash_dir in os.listdir(os.path.join(wrapper_dists, dist_name)):
+            gradle_dir = dist_name.replace("-all", "").replace("-bin", "")
+            gradle_bin = os.path.join(wrapper_dists, dist_name, hash_dir, gradle_dir, "bin", "gradle")
+            if os.path.isfile(gradle_bin):
+                return gradle_bin
+    raise FileNotFoundError("No Gradle 7/8 found in ~/.gradle/wrapper/dists")
+
+
+def patching_and_testing_quixbugs(patch: str, project_meta: dict) -> bool:
+    quixbugs_repo = project_meta["quixbugs_repo"]
+    program_name = project_meta["project_name"]
+    src_file = os.path.join(quixbugs_repo, "java_programs", f"{program_name}.java")
+
+    with open(src_file, encoding="utf-8") as f:
+        original = f.read()
+
+    try:
+        patched_code = patching(patch, original.splitlines())
+    except (NoCodeError, NotPatchError) as e:
+        logging.warning(f"Cannot patch: {e}")
+        return None
+
+    test_class = f"java_testcases.junit.{program_name}_TEST"
+    try:
+        gradle_bin = _find_gradle()
+    except FileNotFoundError as e:
+        logging.error(str(e))
+        return None
+
+    try:
+        with open(src_file, "w", encoding="utf-8") as f:
+            f.write(patched_code)
+        result = subprocess.run(
+            [gradle_bin, "test", "--tests", test_class, "--rerun-tasks"],
+            cwd=quixbugs_repo,
+            capture_output=True,
+            timeout=180,
+        )
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        logging.warning(f"Gradle test timed out for {program_name}")
+        return None
+    finally:
+        with open(src_file, "w", encoding="utf-8") as f:
+            f.write(original)
+
+
+def patching_and_testing_bears(patch: str, project_meta: dict) -> bool:
+    """Apply patch, run mvn test on the Bears checkout, restore original."""
+    import xml.etree.ElementTree as ET
+
+    buggy_file = project_meta["buggy_file_path"]
+    checkout_dir = os.path.join(
+        project_meta["checkout_dir"],
+        f"{project_meta['bug_name']}_buggy",
+    )
+
+    with open(buggy_file, encoding="utf-8") as f:
+        original = f.read()
+
+    try:
+        patched_code = patching(patch, original.splitlines())
+    except (NoCodeError, NotPatchError) as e:
+        logging.warning(f"Cannot patch: {e}")
+        return None
+
+    # Derive failing test class names from failing_tests file
+    failing_tests_path = os.path.join(checkout_dir, "failing_tests")
+    test_classes = []
+    if os.path.exists(failing_tests_path):
+        with open(failing_tests_path) as f:
+            for line in f:
+                if line.startswith("--- "):
+                    cls = line.replace("--- ", "").split("::")[0].strip()
+                    if cls and cls not in test_classes:
+                        test_classes.append(cls)
+
+    cmd = ["mvn", "test", "--no-transfer-progress", "-fae", "-q"]
+    if test_classes:
+        cmd += [f"-Dtest={'+'.join(test_classes)}", "-DfailIfNoTests=false"]
+
+    try:
+        with open(buggy_file, "w", encoding="utf-8") as f:
+            f.write(patched_code)
+        result = subprocess.run(cmd, cwd=checkout_dir, capture_output=True, timeout=600)
+        if result.returncode != 0:
+            return False
+        # Double-check via surefire XML: any <failure> elements?
+        for root_dir, _, files in os.walk(os.path.join(checkout_dir, "target", "surefire-reports")):
+            for fname in files:
+                if not (fname.startswith("TEST-") and fname.endswith(".xml")):
+                    continue
+                try:
+                    tree = ET.parse(os.path.join(root_dir, fname))
+                    if tree.getroot().get("failures", "0") != "0" or tree.getroot().get("errors", "0") != "0":
+                        return False
+                except ET.ParseError:
+                    pass
+        return True
+    except subprocess.TimeoutExpired:
+        logging.warning(f"Maven test timed out for {project_meta['bug_name']}")
+        return None
+    finally:
+        with open(buggy_file, "w", encoding="utf-8") as f:
+            f.write(original)
+
+
 def patching_and_testing(patch: str, project_meta: dict, container_id='7bdc33a65712') -> bool: # Pass testing?
+    if project_meta.get("data_name") == "quixbugs":
+        return patching_and_testing_quixbugs(patch, project_meta)
+    if project_meta.get("data_name") == "bears":
+        return patching_and_testing_bears(patch, project_meta)
+
     import docker
     client = docker.from_env()
     container = client.containers.get(container_id)

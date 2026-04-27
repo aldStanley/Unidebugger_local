@@ -19,7 +19,7 @@ class Fixer(Agent):
         else:
             self.core_msg = "The following code contains a bug:\n" + info["buggy_code"]
             
-        self.__shared_msg(info, pre_agent_resp)
+        self._shared_msg(info, pre_agent_resp)
         if "coverage_report" in info and calculate_token(self.core_msg + info["coverage_report"]) <= token_limit[self.model_name]["overall"]:
             self.core_msg = "Code coverage for failed testcases:\n" + info["coverage_report"] + "\n" + self.core_msg
         

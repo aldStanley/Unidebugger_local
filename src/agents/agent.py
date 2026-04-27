@@ -11,12 +11,26 @@ class RetryError(Exception):
         super().__init__(message)
         self.message = message
 
+COST_PER_TOKEN = {
+    "gpt-4o":              {"input": 2.50 / 1_000_000, "output": 10.00 / 1_000_000},
+    "gpt-4o-2024-08-06":   {"input": 2.50 / 1_000_000, "output": 10.00 / 1_000_000},
+    "gpt-4o-mini":         {"input": 0.15 / 1_000_000, "output": 0.60  / 1_000_000},
+    "deepseek-chat":       {"input": 0.07 / 1_000_000, "output": 1.10  / 1_000_000},
+}
+
 class Agent(ABC):
     def __init__(self, model_name, hash_id, config_path="../config.json") -> None:
         self.model_name = model_name
         self.hash_id = hash_id
         self.client = self.set_client(config_path)
         self.core_msg = None
+        self.usage = {"prompt_tokens": 0, "completion_tokens": 0}
+
+    def get_and_reset_usage(self) -> dict:
+        """Return accumulated token usage and reset counters."""
+        snapshot = dict(self.usage)
+        self.usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        return snapshot
     
     def __str__(self):
         return self.__class__.__name__
@@ -34,7 +48,6 @@ class Agent(ABC):
         config = read_json(config_path)
         if self.model_name.startswith("gpt") or self.model_name.startswith("claude"):
             return openai.OpenAI(
-                base_url="https://api.chatanywhere.tech/v1",                                                                                                            
                 api_key=config["ChatGPT"]
             )
         if self.model_name.startswith("deepseek"):
@@ -93,7 +106,7 @@ class Agent(ABC):
     def __dict_prompt_to_text(self, msg: list[dict]):
         return "\n".join([dct["content"] for dct in msg])
     
-    def __shared_msg(self, info={}, pre_agent_resp={}):
+    def _shared_msg(self, info={}, pre_agent_resp={}):
         self.core_msg += "\nThe code fails on this test:\n" + info["failing_test_cases"]
 
         if "summarizer" in pre_agent_resp and calculate_token(self.core_msg + pre_agent_resp["summarizer"]) <= token_limit[self.model_name]["overall"]:
@@ -102,15 +115,19 @@ class Agent(ABC):
             self.core_msg = "Reference debugging guide:\n" + pre_agent_resp["helper"] + "\n" + self.core_msg
 
 
-    @retry((openai.APIConnectionError, openai.Timeout, openai.APITimeoutError, RetryError), tries=3, delay=2, backoff=2)
+    @retry((openai.APIConnectionError, openai.APITimeoutError, RetryError), tries=3, delay=2, backoff=2)
     def send_message(self, msg: list[dict], tools=[], handling=True):
         if "gemini" not in self.model_name:
             if len(tools) > 0:
                 response = self.client.chat.completions.create(model=self.model_name, messages=msg, tools=tools)
-            else: response = self.client.chat.completions.create(model=self.model_name, messages=msg)
+            else:
+                response = self.client.chat.completions.create(model=self.model_name, messages=msg)
+            if hasattr(response, "usage") and response.usage:
+                self.usage["prompt_tokens"] += response.usage.prompt_tokens
+                self.usage["completion_tokens"] += response.usage.completion_tokens
             if handling: return self.__handle_response(response)
             else: return response
-            
+
         else: # Not tool use
             response = self.client.generate_content(self.__dict_prompt_to_text(msg))
             if handling: return self.__handle_gemini_response(response)

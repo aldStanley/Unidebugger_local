@@ -1,0 +1,8 @@
+.env
+.venv/
+.claude/
+/*.txt
+/*.py
+res/
+tools/
+benchmarks/

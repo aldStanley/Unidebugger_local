@@ -45,13 +45,36 @@ def exist_java(dir_path):
 #     return func_code
 
 
-def get_failing_info(project_dir, model_name):
-    
-    for test_file in ["tests", "test", "src/test/org", "src/test/java", "gson/src/test/java"]:
-        if os.path.exists(f"{project_dir}/{test_file}"):
-            test_file_path = test_file if test_file != "src/test/org" else "src/test"
+def _find_test_root(project_dir: str) -> str | None:
+    """Return the test source root directory, searching subdirs for multi-module projects."""
+    candidates = ["tests", "test", "src/test/java", "src/test/org", "gson/src/test/java"]
+    # Check project root first (fast path)
+    for c in candidates:
+        p = os.path.join(project_dir, c)
+        if os.path.exists(p):
+            return c if c != "src/test/org" else "src/test"
+    # Walk one level of subdirectories (handles multi-module Maven like Bears)
+    try:
+        for sub in os.listdir(project_dir):
+            subdir = os.path.join(project_dir, sub)
+            if not os.path.isdir(subdir):
+                continue
+            for c in ["src/test/java", "src/test/org", "test", "tests"]:
+                p = os.path.join(subdir, c)
+                if os.path.exists(p):
+                    rel = os.path.join(sub, c if c != "src/test/org" else "src/test")
+                    return rel
+    except PermissionError:
+        pass
+    return None
 
-    assert os.path.exists(os.path.join(project_dir, test_file_path)), "\n".join(os.listdir(project_dir))
+
+def get_failing_info(project_dir, model_name):
+    test_file_path = _find_test_root(project_dir)
+    if test_file_path is None or not os.path.exists(os.path.join(project_dir, test_file_path)):
+        logging.warning(f"No test directory found in {project_dir} — returning empty failing_test_cases")
+        return ""
+
     failing_test_cases = ""
     testing_error = ""
     with open(os.path.join(project_dir, "failing_tests")) as rf:
@@ -90,28 +113,51 @@ def print_info_tokens(info):
     print(info["failing_test_cases"])
     print()
 
-def get_info_dict(checkout_dir: str, bug_name: str, model_name: str, root_causes: dict=None):
-    [project_name, buggy_number] = bug_name.split("_")
+def get_info_dict(checkout_dir: str, bug_name: str, model_name: str, root_causes: dict=None, data_name: str="d4j"):
+    # bug_name for QuixBugs: "BITCOUNT_1"; for D4J: "Lang_1"
+    split = bug_name.rsplit("_", 1)
+    project_name, buggy_number = split[0], split[1]
     info = {
         "project_meta": {
             "project_name": project_name,
             "buggy_number": buggy_number,
             "checkout_dir": checkout_dir,
-            "bug_name": bug_name
+            "bug_name": bug_name,
+            "data_name": data_name,
         },
     }
     if root_causes is None:
         root_causes = read_json(os.path.join(checkout_dir, "root_cause_path.json"))
 
-    project_dir = os.path.join(checkout_dir, f"{bug_name}_buggy") 
+    if data_name == "quixbugs":
+        cfg_path = os.path.join(os.path.dirname(checkout_dir), "config.json")
+        if os.path.exists(cfg_path):
+            cfg = read_json(cfg_path)
+            info["project_meta"]["quixbugs_repo"] = cfg.get("quixbugs_repo", "")
+
+    project_dir = os.path.join(checkout_dir, f"{bug_name}_buggy")
     info["project_meta"]["buggy_file_path"] = os.path.join(project_dir, root_causes[bug_name])
-    
-    src_path_split = root_causes[bug_name].split(os.sep)
-    for e in range(1, len(root_causes[bug_name].split(os.sep))+1):
-        src_dir = os.sep.join([project_dir] + src_path_split[:e])
-        if exist_java(src_dir):
-            info["project_meta"]["project_src_path"] = src_dir
-            break
+
+    if data_name == "bears":
+        # Bears source layouts vary — find the highest src dir that contains Java files
+        # so RepoFocus can see the whole project, not just one package.
+        buggy_rel = root_causes[bug_name]   # e.g. "src/org/traccar/protocol/Foo.java"
+        parts = buggy_rel.replace("\\", "/").split("/")
+        # Walk up from the file to find the first ancestor named "java" or "src"
+        bears_src = project_dir
+        for depth in range(1, len(parts)):
+            candidate = os.path.join(project_dir, *parts[:depth])
+            if os.path.isdir(candidate) and parts[depth - 1] in ("java", "src", "main"):
+                bears_src = candidate
+                break
+        info["project_meta"]["project_src_path"] = bears_src
+    else:
+        src_path_split = root_causes[bug_name].split(os.sep)
+        for e in range(1, len(root_causes[bug_name].split(os.sep))+1):
+            src_dir = os.sep.join([project_dir] + src_path_split[:e])
+            if exist_java(src_dir):
+                info["project_meta"]["project_src_path"] = src_dir
+                break
 
     with open(info["project_meta"]["buggy_file_path"]) as rf:
         info["raw_code"] = rf.read()

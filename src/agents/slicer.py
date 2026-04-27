@@ -1,10 +1,12 @@
 import os
+import logging
 from retry import retry
 import json
 from utils import read_yaml,read_json
 from parse import *
 from agents.agent import Agent, RetryError
 from prompts.tokens import *
+from spotbugs_runner import run_static_analysis
 
 
 class Slicer(Agent):
@@ -49,7 +51,7 @@ class Slicer(Agent):
                 real_seg = "\n".join(real_seg_lines[::-1])
             else:
                 real_seg_lines = []
-                for i in range(max(0, seg_s-10), seg_s+50):
+                for i in range(max(0, seg_s-10), min(len(raw_code_lines), seg_s+50)):
                     if len(real_seg_lines) >= 50: break
                     if not(raw_code_lines[i].strip().startswith('*') or raw_code_lines[i].strip().startswith('/*')):
                         real_seg_lines.append(raw_code_lines[i])
@@ -59,9 +61,18 @@ class Slicer(Agent):
 
     def __generate_core_msg(self, info, pre_agent_resp):
         self.core_msg = "The following code contains a bug:\n" + info["buggy_code"]
-        self.__shared_msg(info, pre_agent_resp)
+        self._shared_msg(info, pre_agent_resp)
         if "coverage_report" in info and calculate_token(self.core_msg + info["coverage_report"]) <= token_limit[self.model_name]["overall"]:
             self.core_msg = "Code coverage for failed testcases:\n" + info["coverage_report"] + "\n" + self.core_msg
+
+        # Prepend SpotBugs / method-range hint if available
+        try:
+            analysis = run_static_analysis(info)
+            hint = analysis.get("hint", "")
+            if hint and calculate_token(self.core_msg + hint) <= token_limit[self.model_name]["overall"]:
+                self.core_msg = hint + "\n" + self.core_msg
+        except Exception as e:
+            logging.debug(f"Static analysis skipped: {e}")
 
         logging.info(f"Current core message tokens: {calculate_token(self.core_msg)}")
 

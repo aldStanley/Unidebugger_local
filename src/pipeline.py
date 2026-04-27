@@ -1,5 +1,6 @@
 import sys
 import os
+import csv
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.agents.fixer import Fixer
@@ -21,7 +22,7 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("--limit", default=1, type=int)
 parser.add_argument("--model_name", default="gpt-3.5-turbo-ca", choices=list(token_limit.keys()))
-parser.add_argument("--data_name", default="d4j")
+parser.add_argument("--data_name", default="d4j", choices=["d4j", "quixbugs", "bears"])
 parser.add_argument("--level", default=3, type=int)
 parser.add_argument("--container_id", default='7bdc33a65712', type=str)
 parser.add_argument("--re_patch_num", default=2, type=int)
@@ -31,7 +32,7 @@ params = vars(parser.parse_args())
 
 role_dict = {"repofocus": RepoFocus, "locator": Locator, "fixer": Fixer, "slicer": Slicer, "summarizer": Summarizer, "fixerpro": FixerPro, "helper": Helper}
 suffix_dict = {"repofocus": "json", "locator": "java", "fixer": "patch", "slicer": "java", "summarizer": "json", "fixerpro": "patch", "helper": "txt"}
-level_dict = {1: ["locator", "fixer"], 2: ["summarizer", "slicer", "locator", "fixer"], 3: ["helper", "repofocus", "summarizer", "slicer", "locator", "fixer", "fixerpro"]}
+level_dict = {1: ["locator", "fixer"], 2: ["summarizer", "slicer", "locator", "fixer", "fixerpro"], 3: ["helper", "repofocus", "summarizer", "slicer", "locator", "fixer", "fixerpro"]}
 
 class Pipeline():
     def __init__(self, 
@@ -62,7 +63,36 @@ class Pipeline():
 
         self.messages = {}
         self.agent_resp = {}
-    
+
+        # Cost tracking
+        self._cost_rates = {
+            "gpt-4o":            {"input": 2.50 / 1_000_000, "output": 10.00 / 1_000_000},
+            "gpt-4o-2024-08-06": {"input": 2.50 / 1_000_000, "output": 10.00 / 1_000_000},
+            "gpt-4o-mini":       {"input": 0.15 / 1_000_000, "output": 0.60  / 1_000_000},
+            "deepseek-chat":     {"input": 0.07 / 1_000_000, "output": 1.10  / 1_000_000},
+        }
+        self._cost_file = os.path.join(self.record_dir, "cost.csv")
+        if not os.path.exists(self._cost_file):
+            with open(self._cost_file, "w", newline="") as f:
+                csv.writer(f).writerow(["bug_name", "prompt_tokens", "completion_tokens", "cost_usd", "plausible"])
+
+    def _compute_cost(self, prompt_tokens: int, completion_tokens: int) -> float:
+        rates = self._cost_rates.get(self.model_name, {"input": 0.0, "output": 0.0})
+        return prompt_tokens * rates["input"] + completion_tokens * rates["output"]
+
+    def _collect_and_record_cost(self, bug_name: str, plausible: bool):
+        """Sum token usage across all agents, write one CSV row, reset counters."""
+        total_prompt, total_completion = 0, 0
+        for agent in self.framework.values():
+            u = agent.get_and_reset_usage()
+            total_prompt += u["prompt_tokens"]
+            total_completion += u["completion_tokens"]
+        cost = self._compute_cost(total_prompt, total_completion)
+        logging.info(f"Cost for {bug_name}: ${cost:.4f} ({total_prompt} in + {total_completion} out tokens)")
+        with open(self._cost_file, "a", newline="") as f:
+            csv.writer(f).writerow([bug_name, total_prompt, total_completion, f"{cost:.6f}", plausible])
+        return total_prompt, total_completion, cost
+
     def repair_with_fl(self, info, fl_path: str, re_patch_num=3): #ablation study only
         if os.path.exists(fl_path):
             assert fl_path.endswith(".java")
@@ -260,21 +290,28 @@ class Pipeline():
         cnt = work_num + len(self.records["failed"]) 
         
         for bug_name in sorted(list(root_casues.keys())):
-            if limit > 0 and cnt >= limit: return work_num, plau_num
+            if limit > 0 and cnt >= limit: break
             if bug_name in self.records["failed"] + self.records["worked"]: continue
             logging.info(f"Running on {cnt+1}-th bug {bug_name} @{self.hash_id}")
-            
+
+            # Reset agent state for each new bug
+            self.agent_resp = {}
+            for agent in self.framework.values():
+                agent.core_msg = None
+
             info = get_info_dict(
-                os.path.abspath(f"../benchmarks/{self.data_name}/checkouts"), 
-                bug_name=bug_name, 
+                os.path.abspath(f"../benchmarks/{self.data_name}/checkouts"),
+                bug_name=bug_name,
                 model_name=self.model_name,
                 root_causes=root_casues,
+                data_name=self.data_name,
             )
             print()
             logging.info("***** Level 1 repairing...")
             plausible, patch = self.level_1_repair(info=info, re_patch_num=re_patch_num)
             if plausible: write_line(os.path.join(self.record_dir, "plausible_level1.txt"), bug_name)
-            plausible, patch = False, None
+            if self.level >= 2:
+                plausible, patch = False, None
             if not plausible and self.level >= 2:
                 print()
                 logging.info("***** Level 2 repairing...")
@@ -283,7 +320,10 @@ class Pipeline():
                 if not plausible and self.level >= 3:
                     print()
                     logging.info("***** Level 3 repairing...")
-                    plausible, patch = self.level_3_repair(info=info, re_patch_num=re_patch_num)
+                    try:
+                        plausible, patch = self.level_3_repair(info=info, re_patch_num=re_patch_num)
+                    except Exception as e:
+                        logging.warning(f"Level 3 repair failed for {bug_name}: {e}")
                 if not plausible and self.refinement:
                     print()
                     logging.info("***** Refining...")
@@ -300,10 +340,31 @@ class Pipeline():
             else:
                 write_line(os.path.join(self.record_dir, "implausi.txt"), bug_name)
 
+            plausible = bool(plausible)  # coerce None (timeout) → False
             plau_num += plausible; work_num += (patch is not None)
+            self._collect_and_record_cost(bug_name, plausible)
             cnt += 1
-            
+
+        # Write cost summary
+        self._write_cost_summary()
         return work_num, plau_num
+
+    def _write_cost_summary(self):
+        """Read cost.csv and append a TOTAL row, then log the summary."""
+        total_prompt, total_completion, total_cost, n_bugs = 0, 0, 0.0, 0
+        try:
+            with open(self._cost_file, newline="") as f:
+                for row in list(csv.DictReader(f)):
+                    total_prompt += int(row["prompt_tokens"])
+                    total_completion += int(row["completion_tokens"])
+                    total_cost += float(row["cost_usd"])
+                    n_bugs += 1
+        except FileNotFoundError:
+            return
+        with open(self._cost_file, "a", newline="") as f:
+            csv.writer(f).writerow(["TOTAL", total_prompt, total_completion, f"{total_cost:.6f}", f"{n_bugs} bugs"])
+        logging.info(f"Total cost: ${total_cost:.4f} over {n_bugs} bugs "
+                     f"({total_prompt} in + {total_completion} out tokens)")
 
 if __name__ == "__main__": 
 

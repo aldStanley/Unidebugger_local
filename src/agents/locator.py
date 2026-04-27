@@ -8,6 +8,7 @@ from agents.agent import Agent, RetryError
 from prompts.tokens import *
 from utils import read_yaml
 from parse import *
+from gzoltar_runner import run_fault_localization, format_sbfl_hint
 
   
 class Locator(Agent):
@@ -83,8 +84,17 @@ class Locator(Agent):
             self.core_msg = "The following code contains a bug:\n" + pre_agent_resp["slicer"]
         else:
             self.core_msg = "The following code contains a bug:\n" + info["buggy_code"]
-        
-        self.__shared_msg(info, pre_agent_resp)
+
+        # Prepend SBFL rankings if they fit within token budget
+        try:
+            sbfl = run_fault_localization(info)
+            hint = format_sbfl_hint(sbfl, top_k=5)
+            if hint and calculate_token(self.core_msg + hint) <= token_limit[self.model_name]["overall"]:
+                self.core_msg = hint + "\n" + self.core_msg
+        except Exception as e:
+            logging.debug(f"Fault localization skipped: {e}")
+
+        self._shared_msg(info, pre_agent_resp)
         logging.info(f"Current core message tokens: {calculate_token(self.core_msg)}")
 
     def fast_parse(self, response):
@@ -126,7 +136,7 @@ class Locator(Agent):
                     if response.choices[0].finish_reason == "tool_calls":
                         if "coverage_report" in info:
                             context = info["coverage_report"]
-                        else: 
+                        else:
                             context = "Coverage report it not available currently"
                         response = self.send_message([
                                 {"role": "system", "content": self.prompts_dict["sys"]},
@@ -135,6 +145,8 @@ class Locator(Agent):
                                 {"role": "tool", "content": context, "tool_call_id": response.choices[0].message.tool_calls[0].id},
                             ]
                         )
+                    else:
+                        response = response.choices[0].message.content
                 else:
                     if "coverage_report" in info and calculate_token(self.core_msg + info["coverage_report"]) <= token_limit[self.model_name]["overall"]:
                         self.core_msg = "Code coverage for failed testcases:\n" + info["coverage_report"] + "\n" + self.core_msg

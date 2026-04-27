@@ -5,16 +5,26 @@ from parse import parse_code, parse_exp
 from utils import read_yaml
 from agents.agent import Agent, RetryError
 from prompts.tokens import *
-import subprocess
-
 
 class RepoFocus(Agent):
     def parse_response(self, response: str, project_src_path: str):
         files = "\n".join([p.strip() for p in parse_code(response) if len(p.strip()) > 0])
         if "===" in files:
             files = files[:files.find("===")].strip()
-        valid_files = [f for f in files.splitlines() 
-                       if os.path.exists(os.path.join(project_src_path, f)) and "Test" not in f]
+        valid_files = []
+        for f in files.splitlines():
+            f = f.strip()
+            if not f:
+                continue
+            if os.path.exists(os.path.join(project_src_path, f)) and "Test" not in f:
+                valid_files.append(f)
+                continue
+            # Strip one leading directory component (e.g. "java_programs/Foo.java" -> "Foo.java")
+            parts = f.replace("\\", "/").split("/", 1)
+            if len(parts) == 2:
+                stripped = parts[1]
+                if os.path.exists(os.path.join(project_src_path, stripped)) and "Test" not in stripped:
+                    valid_files.append(stripped)
         if len(valid_files) == 0:
            raise RetryError(f"No valid files {files}")
         elif len(valid_files) > 5:
@@ -22,9 +32,22 @@ class RepoFocus(Agent):
             logging.warning("Too many valid files:\n" + '\n'.join(valid_files))
         return {"aim": valid_files, "exp": parse_exp(response), "ori": response}
 
-    def __generate_core_msg(self, info):
-        structure = subprocess.run(["tree"], cwd=info["project_meta"]["project_src_path"], capture_output=True, text=True).stdout
+    @staticmethod
+    def __dir_tree(root: str, prefix: str = "") -> str:
+        lines = [os.path.basename(root)]
+        entries = sorted(os.listdir(root)) if os.path.isdir(root) else []
+        for i, name in enumerate(entries):
+            connector = "└── " if i == len(entries) - 1 else "├── "
+            child = os.path.join(root, name)
+            lines.append(prefix + connector + name)
+            if os.path.isdir(child):
+                extension = "    " if i == len(entries) - 1 else "│   "
+                subtree = RepoFocus.__dir_tree(child, prefix + extension)
+                lines.extend(subtree.splitlines()[1:])
+        return "\n".join(lines)
 
+    def __generate_core_msg(self, info):
+        structure = self.__dir_tree(info["project_meta"]["project_src_path"])
         self.core_msg = "Imported packages in the bug-located code file:\n" + info["packages"] + \
                         "\nThe code fails on this test:\n" + info["failing_test_cases"] + \
                         "\nStructrue of source code directory:\n" + structure

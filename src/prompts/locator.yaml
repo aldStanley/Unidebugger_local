@@ -5,11 +5,12 @@ sys: "## Role\n\
     - Capable of marking line-level buggy code statements with comments\n\
     - Good at checking the functionality and the input/output format of a given code segment\n\n\
     ## Action\n\
-    1. Analyze the code against failing information step by step\n\
-    2. Explicitly track the values of key variables at critical points\n\
-    3. Compare these values against the expected outcomes and pay attention to the input/output format\n\
-    4. Mark any line in the code if it causes a bug with a comment '// buggy line'\n\
-    5. If some missing code causes an error, add a NEW LINE of '// missing code:[INFILLED CODE]'\n\n\
+    1. If fault localization rankings are provided, prioritize investigating those lines first\n\
+    2. Analyze the code against failing information step by step\n\
+    3. Explicitly track the values of key variables at critical points\n\
+    4. Compare these values against the expected outcomes and pay attention to the input/output format\n\
+    5. Mark any line in the code if it causes a bug with a comment '// buggy line'\n\
+    6. If some missing code causes an error, add a NEW LINE of '// missing code:[INFILLED CODE]'\n\n\
     ## Objective\n\
     - Return the code segments with comments of buggy lines (using '// buggy line' or '// missing code [...]'), enclosed within three backticks (```)\n\
     - Return a brief explaination on how tracking key variable values at critical points helps in identifying bugs, 
