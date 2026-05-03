@@ -10,7 +10,32 @@ from utils import read_yaml
 from parse import *
 from gzoltar_runner import run_fault_localization, format_sbfl_hint
 
-  
+_COVERAGE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "failing_coverage",
+        "description": "Get code coverage for failed testcases.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+_METHOD_BODY_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_method_body",
+        "description": "Fetch the full source of a named method from a related file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "method_name": {"type": "string", "description": "The method name to fetch"},
+                "file_path": {"type": "string", "description": "Optional relative file path to narrow the search"},
+            },
+            "required": ["method_name"],
+        },
+    },
+}
+
+
 class Locator(Agent):
 
     def parse_response(self, response: str, raw_code: str, comment_label="//"):
@@ -20,14 +45,14 @@ class Locator(Agent):
             resp_code = resp_code[:resp_code.find("===")].strip()
         resp_lines, raw_code_lines = resp_code.splitlines(), raw_code.splitlines()
         raw_lines_w_marks = [l for l in raw_code_lines] # return
-        
+
         mark_indces = {i: (-1, "") for i, l in enumerate(resp_lines) if "missing" in l or "buggy" in l}  # record the index of marked line
         for i, l in enumerate(resp_lines):
             if i not in mark_indces and i - 1 in mark_indces and not exist_line(l, raw_code_lines):
                 mark_indces[i] = (-2, "")
         if len(mark_indces) == 0:
             raise RetryError("No mark in the response!")
-        
+
         for resp_idx in sorted(list(mark_indces.keys())):
             if mark_indces[resp_idx][0] == -2 and resp_idx - 1 in mark_indces and mark_indces[resp_idx - 1][0] >= 0:
                 mark_indces[resp_idx] = mark_indces[resp_idx - 1]
@@ -42,7 +67,7 @@ class Locator(Agent):
                 continue
 
             code, comment = resp_lines[resp_idx].split(comment_label)[0].rstrip(), comment_label.join(resp_lines[resp_idx].split(comment_label)[1:]).strip()
-            
+
             unique_idx = unique_matching(resp_lines, raw_code_lines, resp_idx)
             if unique_idx >= 0:
                 raw_lines_w_marks[unique_idx] += " // " + comment
@@ -62,12 +87,12 @@ class Locator(Agent):
                     unique_idx = unique_matching(resp_lines, raw_code_lines, post_valid[0], existing=True)
                     if unique_idx >= 0:
                         raw_lines_w_marks[unique_idx] = (f"/* missing code:[{code}] // {comment} */\n") + raw_lines_w_marks[unique_idx]
-                        mark_indces[resp_idx] = (unique_idx, "post")         
-        
+                        mark_indces[resp_idx] = (unique_idx, "post")
+
         if sum(list([i[0]>=0 for i in mark_indces.values()])) == 0:
             raise RetryError(f"Cannot mark any line with {len(mark_indces)} marks")
-        
-        if sum(list([i[0]>=0 for i in mark_indces.values()])) < len(mark_indces): 
+
+        if sum(list([i[0]>=0 for i in mark_indces.values()])) < len(mark_indces):
             for mark_idx in mark_indces:
                 if not mark_indces[mark_idx]:
                     resp_lines[mark_idx] += "  // Cannot Mark!"
@@ -102,74 +127,74 @@ class Locator(Agent):
         if "===" in resp_code:
             resp_code = resp_code[:resp_code.find("===")].strip()
         return {"aim": resp_code, "exp": parse_exp(response), "ori": response}
-    
+
+    def _handle_tool_call(self, name: str, args: dict, info: dict) -> str:
+        if name == "failing_coverage":
+            return info.get("coverage_report", "Coverage report is not available currently.")
+        if name == "get_method_body":
+            rag = info.get("rag")
+            if rag is None:
+                return "Method index not available (RAG not built for this run)."
+            return rag.get_method_body(args["method_name"], args.get("file_path"))
+        return f"Unknown tool: {name}"
+
     def run(self, info: dict, pre_agent_resp: dict={}, max_retries=5, *args):
         logging.info("## Running Locator...")
         self.prompts_dict = read_yaml(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../prompts/locator.yaml"))
         if self.core_msg is None:
             self.__generate_core_msg(info, pre_agent_resp)
-        
+
         raw_code = pre_agent_resp["slicer"] if "slicer" in pre_agent_resp else info["buggy_code"]
-        
+        coverage_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../tools/coverage_report.txt")
+
         attempt = 0
         bk_resp = None
-        
+
         while attempt < max_retries:
             try:
-                if not os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../tools/coverage_report.txt")):
-                    response = self.send_message([
-                        {"role": "system", "content": self.prompts_dict["sys"]},
-                        {"role": "user", "content": self.core_msg + "\n" + self.prompts_dict["end"]}],
-                        handling=False,
-                        tools=[{"type": "function",
-                            "function": {
-                                "name": "failing_coverage",
-                                "description": "Get code coverage for failed testcases.",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {},
-                                    "required": [],
-                                }
-                            }
-                        }],   
-                    )
-                    if response.choices[0].finish_reason == "tool_calls":
-                        if "coverage_report" in info:
-                            context = info["coverage_report"]
-                        else:
-                            context = "Coverage report it not available currently"
-                        response = self.send_message([
-                                {"role": "system", "content": self.prompts_dict["sys"]},
-                                {"role": "user", "content": self.core_msg + "\n" + self.prompts_dict["end"]},
-                                response.choices[0].message,
-                                {"role": "tool", "content": context, "tool_call_id": response.choices[0].message.tool_calls[0].id},
-                            ]
-                        )
-                    else:
-                        response = response.choices[0].message.content
-                else:
+                messages = [
+                    {"role": "system", "content": self.prompts_dict["sys"]},
+                    {"role": "user", "content": self.core_msg + "\n" + self.prompts_dict["end"]},
+                ]
+
+                if os.path.exists(coverage_file):
+                    # Coverage already on disk — inject it and skip tool use
                     if "coverage_report" in info and calculate_token(self.core_msg + info["coverage_report"]) <= token_limit[self.model_name]["overall"]:
                         self.core_msg = "Code coverage for failed testcases:\n" + info["coverage_report"] + "\n" + self.core_msg
-                    response = self.send_message([
-                        {"role": "system", "content": self.prompts_dict["sys"]},
-                        {"role": "user", "content": self.core_msg + "\n" + self.prompts_dict["end"]}],
+                        messages[1]["content"] = self.core_msg + "\n" + self.prompts_dict["end"]
+                    response = self._tool_loop(
+                        messages,
+                        [_METHOD_BODY_TOOL],
+                        lambda n, a: self._handle_tool_call(n, a, info),
                     )
+                else:
+                    # Offer both tools so the LLM can request coverage or method bodies
+                    response = self._tool_loop(
+                        messages,
+                        [_COVERAGE_TOOL, _METHOD_BODY_TOOL],
+                        lambda n, a: self._handle_tool_call(n, a, info),
+                    )
+
                 return self.parse_response(response, raw_code)
             except NoCodeError:
                 attempt += 1
                 logging.warning("No code, try again")
             except RetryError:
                 attempt += 1
-                mark = sum([("// buggy line" in l or "// missing" in l) for l in parse_code(response)])
-                if mark > 0: bk_resp = response
-                else:
+                try:
+                    mark = sum([("// buggy line" in l or "// missing" in l) for l in parse_code(response)])
+                    if mark > 0:
+                        bk_resp = response
+                    else:
+                        logging.warning("Cannot mark any line, try again")
+                except Exception:
                     logging.warning("Cannot mark any line, try again")
-        
+
         if bk_resp is not None:
             return self.fast_parse(bk_resp)
         else:
             raise ValueError("No avaliable localization results!")
-    
+
     def refine(self, assist_resp, *args):
         refine_prompt = read_yaml(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../prompts/refine.yaml"))
         return self.parse_response(self.send_message([
@@ -178,73 +203,6 @@ class Locator(Agent):
                     {"role": "assistant", "content": assist_resp},
                     {"role": "user", "content": "\nModifying your marked lines cannot fix the bug:\n" + refine_prompt["locator"]}
                 ]
-            )
+            ),
+            raw_code=self.core_msg,
         )
-
-if __name__ == "__main__":
-    locator = Locator(model_name="gpt_4o", hash_id="temporal", config_path="/Users/cheryl/Desktop/src/config.json")
-    response = '''
-    ```
-    add_0 // missing code
-    add_1 
-    add_2
-    add_3
-    post neibor, degree == 1
-    post neibor, degree == 2
-    post neibor, degree == 3
-    post neibor, degree == 4
-    post neibor, degree == 5
-    end
-    ```
-    ===
-    explain
-    ===
-    '''
-
-    raw_code = '''
-    head
-    post neibor, degree == 1
-    post neibor, degree == 2
-    post neibor, degree == 3
-    post neibor, degree == 4
-    post neibor, degree == 5
-    end
-    ==================
-    head
-    post neibor, degree == 1
-    post neibor, degree == 2
-    post neibor, degree == 3
-    post neibor, degree == 4
-    end
-    ==================
-    head
-    pre neibor, degree == 3
-    pre neibor, degree == 2
-    pre neibor, degree == 1
-    my buggy code // three
-    post neibor, degree == 1
-    post neibor, degree == 2
-    post neibor, degree == 3
-    end
-    ==================
-    head
-    pre neibor, degree == 2
-    pre neibor, degree == 1
-    my buggy code // four
-    post neibor, degree == 1
-    post neibor, degree == 2
-    end
-    ==================
-    head
-    pre neibor, degree == 1
-    my buggy code // five
-    post neibor, degree == 1
-    end
-    ==================
-    head
-    my buggy code // six
-    end
-    '''
-
-    result = locator.parse_response(response, raw_code)["aim"]
-    print(result)

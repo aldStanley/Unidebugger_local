@@ -1,4 +1,5 @@
 import os
+from typing import Optional
 from utils import *
 from prompts.tokens import *
 
@@ -45,7 +46,7 @@ def exist_java(dir_path):
 #     return func_code
 
 
-def _find_test_root(project_dir: str) -> str | None:
+def _find_test_root(project_dir: str) -> Optional[str]:
     """Return the test source root directory, searching subdirs for multi-module projects."""
     candidates = ["tests", "test", "src/test/java", "src/test/org", "gson/src/test/java"]
     # Check project root first (fast path)
@@ -84,7 +85,10 @@ def get_failing_info(project_dir, model_name):
     testing_error = ""
     for l in failing_info:
         if l.startswith("--- "):
-            ori_path, func = l.replace("--- ", "").split("::")
+            parts = l.replace("--- ", "").split("::")
+            if len(parts) < 2:
+                continue
+            ori_path, func = parts[0], parts[1]
             path = os.sep.join(ori_path.split(".")) + ".java"
             if os.path.exists(os.path.join(project_dir, test_file_path, path)):
                 with open(os.path.join(project_dir, test_file_path, path)) as rf:

@@ -7,3 +7,6 @@ res/
 tools/
 benchmarks/
 config.json
+defects4j/
+QuixBugs/
+Unidebugger/__pycache__/

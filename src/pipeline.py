@@ -27,6 +27,8 @@ parser.add_argument("--level", default=3, type=int)
 parser.add_argument("--container_id", default='7bdc33a65712', type=str)
 parser.add_argument("--re_patch_num", default=2, type=int)
 parser.add_argument("--refinement", action="store_true")
+parser.add_argument("--prev_hash", default=None, type=str,
+                    help="hash_id of a previous level run to load agent responses from")
 
 params = vars(parser.parse_args())
 
@@ -35,19 +37,21 @@ suffix_dict = {"repofocus": "json", "locator": "java", "fixer": "patch", "slicer
 level_dict = {1: ["locator", "fixer"], 2: ["summarizer", "slicer", "locator", "fixer", "fixerpro"], 3: ["helper", "repofocus", "summarizer", "slicer", "locator", "fixer", "fixerpro"]}
 
 class Pipeline():
-    def __init__(self, 
+    def __init__(self,
                  model_name: str,
                  container_id,
                  data_name,
                  refinement=False,
                  level=3,
+                 prev_hash=None,
                  **kwargs):
-        
+
         self.model_name = model_name
         self.container_id = container_id
         self.data_name = data_name
         self.level = level
         self.refinement = refinement
+        self.prev_hash = prev_hash
         self.record_dir, self.hash_id = dump_exp(f"../res/{data_name}/records", 
                                                  {"model_name": model_name, "level": level}
                                         )
@@ -63,6 +67,7 @@ class Pipeline():
 
         self.messages = {}
         self.agent_resp = {}
+        self._rag = None
 
         # Cost tracking
         self._cost_rates = {
@@ -154,51 +159,84 @@ class Pipeline():
         else:
             return True, patch
     
-    def level_3_repair(self, info: dict, re_patch_num=3):
-        ##### Identify a list of suspious files
+    def _build_rag(self, info: dict):
+        """Build a shared LocalRAG index for the current bug and store it in info["rag"]."""
+        try:
+            from local_rag import LocalRAG
+            repo_path = info["project_meta"].get("project_src_path", info["project_meta"]["checkout_dir"])
+            client = next(iter(self.framework.values())).client
+            self._rag = LocalRAG(repo_path, openai_client=client if not hasattr(client, 'generate_content') else None)
+            self._rag.build_index()
+            info["rag"] = self._rag
+            logging.info(f"Built shared RAG index with {len(self._rag.index)} symbols")
+        except Exception as e:
+            logging.warning(f"Could not build shared RAG: {e}")
+            info["rag"] = None
+
+    def _run_repofocus_and_summarize(self, info: dict, re_patch_num=3):
+        """Run RepoFocus + multi-file Summarizer and return the list of identified files."""
         det_response = self.framework["repofocus"].run(info)
         self.save(role="repofocus", response_dict=det_response, bug_name=info['project_meta']['bug_name'])
         aim_file_lst = []
         for file in det_response["aim"]:
             if not file.endswith("java"): continue
-            if os.path.exists(os.path.join(info["project_meta"]["project_src_path"], file)): aim_file_lst.append(file)
-            else: logging.warning(f"Not exist: {os.path.join(info['project_meta']['project_src_path'], file)}")
+            if os.path.exists(os.path.join(info["project_meta"]["project_src_path"], file)):
+                aim_file_lst.append(file)
+            else:
+                logging.warning(f"Not exist: {os.path.join(info['project_meta']['project_src_path'], file)}")
         logging.info(f"There are {len(aim_file_lst)} code files need to be summerized")
 
-        ##### Search for references
-        hel_response = self.framework["helper"].run(info)
-        self.save(role="helper", response_dict=hel_response, bug_name=info['project_meta']['bug_name'])
-
-        ##### Summerize multiple files
         if "summarizer" in self.agent_resp:
             summary = {"root": json.dumps(self.agent_resp["summarizer"])}
         else:
             sum_response = self.framework["summarizer"].run(info["buggy_code"])
             self.save(role="summarizer", response_dict=sum_response, bug_name=info['project_meta']['bug_name'])
             summary = {"root": sum_response["aim"]}
-        
+
         if calculate_token(json.dumps(summary)) < token_limit[self.model_name]["summary"]:
             logging.info(f"## Running Summarizer on multiple files...")
             for file in list(set(aim_file_lst)):
                 if os.path.join(info["project_meta"]["project_src_path"], file) == info["project_meta"]["buggy_file_path"]: continue
                 logging.info(f"* {file}")
-                
                 with open(os.path.join(info["project_meta"]["project_src_path"], file)) as rf:
                     code = shorten(rf.read(), token_limit[self.model_name]["buggy_code"])
                 if calculate_token(code) >= token_limit[self.model_name]["buggy_code"]:
                     logging.warning(f"Too long code file: {file}")
                     continue
-
                 sum_response = self.framework["summarizer"].run(code)
                 if calculate_token(json.dumps(summary)) + calculate_token(json.dumps(sum_response["aim"])) >= token_limit[self.model_name]["summary"]:
                     break
                 summary.update({file: sum_response["aim"]})
-                
-        self.save(role="summarizer", 
-                  response_dict={"ori": json.dumps(summary), "aim": summary, "exp": ""}, 
-                  bug_name=info['project_meta']['bug_name']
-        )
-        
+
+        self.save(role="summarizer",
+                  response_dict={"ori": json.dumps(summary), "aim": summary, "exp": ""},
+                  bug_name=info['project_meta']['bug_name'])
+        return aim_file_lst
+
+    def level_3_repair(self, info: dict, re_patch_num=3):
+        ##### Build shared RAG index
+        self._build_rag(info)
+
+        ##### Identify a list of suspious files + summarize them
+        self._run_repofocus_and_summarize(info)
+
+        ##### Search for references
+        hel_response = self.framework["helper"].run(info)
+        self.save(role="helper", response_dict=hel_response, bug_name=info['project_meta']['bug_name'])
+
+        ##### First attempt — Level 2 with cross-file context already in agent_resp
+        try:
+            return self.level_2_repair(info, re_patch_num=re_patch_num)
+        except ValueError:
+            logging.warning("Locator failed in L3 first attempt — re-running RepoFocus with additional context.")
+
+        ##### Iterative file selection — reset and try a second set of files
+        for role in ("repofocus", "locator", "slicer", "fixer", "fixerpro"):
+            if role in self.framework:
+                self.framework[role].core_msg = None
+        self.agent_resp.pop("repofocus", None)
+
+        self._run_repofocus_and_summarize(info)
         return self.level_2_repair(info, re_patch_num=re_patch_num)
         
         
@@ -284,6 +322,31 @@ class Pipeline():
         
         self.messages[role] = response_dict["ori"]
             
+    def _load_prev_responses(self, bug_name: str) -> bool:
+        """Load saved agent responses from a previous level run into self.agent_resp.
+
+        Returns True if the bug was already solved (plausible) in that run,
+        meaning it should be skipped at this level.
+        """
+        if not self.prev_hash:
+            return False
+        prev_resp_dir = os.path.join(f"../res/{self.data_name}/resp", self.prev_hash)
+        prev_record_dir = os.path.join(f"../res/{self.data_name}/records", self.prev_hash)
+
+        # Skip bugs already fixed at the previous level
+        prev_plausible = return_lines(os.path.join(prev_record_dir, "plausible.txt"))
+        if bug_name in prev_plausible:
+            return True
+
+        # Load each agent's saved aim response into self.agent_resp
+        for role, suffix in suffix_dict.items():
+            aim_path = os.path.join(prev_resp_dir, role, "aim", f"{bug_name}.{suffix}")
+            if os.path.exists(aim_path):
+                with open(aim_path) as f:
+                    self.agent_resp[role] = f.read()
+                logging.info(f"  [prev] loaded {role} for {bug_name}")
+        return False
+
     def looping(self, limit=-1, re_patch_num=3, **kwargs):
         root_casues = read_json(f"../benchmarks/{self.data_name}/root_cause_path.json")
         work_num, plau_num = len(self.records["worked"]), len(self.records["plausible"])
@@ -299,6 +362,14 @@ class Pipeline():
             for agent in self.framework.values():
                 agent.core_msg = None
 
+            # Load outputs from previous level run; skip if already solved
+            if self._load_prev_responses(bug_name):
+                logging.info(f"Skipping {bug_name} — already solved at previous level")
+                write_line(os.path.join(self.record_dir, "worked.txt"), bug_name)
+                write_line(os.path.join(self.record_dir, "plausible.txt"), bug_name)
+                plau_num += 1; work_num += 1; cnt += 1
+                continue
+
             info = get_info_dict(
                 os.path.abspath(f"../benchmarks/{self.data_name}/checkouts"),
                 bug_name=bug_name,
@@ -310,8 +381,6 @@ class Pipeline():
             logging.info("***** Level 1 repairing...")
             plausible, patch = self.level_1_repair(info=info, re_patch_num=re_patch_num)
             if plausible: write_line(os.path.join(self.record_dir, "plausible_level1.txt"), bug_name)
-            if self.level >= 2:
-                plausible, patch = False, None
             if not plausible and self.level >= 2:
                 print()
                 logging.info("***** Level 2 repairing...")

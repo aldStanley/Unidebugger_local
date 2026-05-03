@@ -2,22 +2,35 @@ import os
 import logging
 import re
 import subprocess
-import signal
+from typing import Optional
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from parse import *
 
-class TimeoutException(Exception):
-    pass
-
-def timeout_handler(signum, frame):
-    raise TimeoutException("TimeOut")
 
 class NotPatchError(Exception):
     def __init__(self, message):
         super().__init__(message)
         self.message = message
         print(message)
+
+def split_multi_file_patch(patch: str) -> dict:
+    """Split a multi-file git diff into {rel_file_path: hunk_str}. Returns {} for single-file patches without a diff --git header."""
+    hunks = {}
+    current_file = None
+    current_lines = []
+    for line in patch.splitlines(keepends=True):
+        m = re.match(r'^diff --git a/(.*?) b/', line)
+        if m:
+            if current_file and current_lines:
+                hunks[current_file] = "".join(current_lines)
+            current_file = m.group(1)
+            current_lines = [line]
+        elif current_file:
+            current_lines.append(line)
+    if current_file and current_lines:
+        hunks[current_file] = "".join(current_lines)
+    return hunks
 
 def format_patch_lines(patch: str) -> list[str]:
     return re.compile(r'(@@[\s\d\+\-\,]+@@)(\s+[a-zA-Z]+)').sub(r'\1\n\2', patch).splitlines()
@@ -87,8 +100,12 @@ def patching(patch: str, raw_code_lines: list[str]) -> str: # return patched cod
         if re.search(r'^[-](\s|\t)+.*$', pline): # del sth
             to_patch_num += 1
             if pre_patch_idx >= 0 and pre_patch_idx + 1 == pidx and patch_lines[pre_patch_idx][0] == '-': #del multi lines
-                    patched[replace_idx + 1] = ""
-                    replace_idx, pre_patch_idx = replace_idx + 1, pidx
+                    if replace_idx + 1 < len(patched):
+                        patched[replace_idx + 1] = ""
+                        replace_idx, pre_patch_idx = replace_idx + 1, pidx
+                    else:
+                        logging.warning(f"Cannot patch (out of range) {pline}!")
+                        unpatched_lines.append((pidx, pline))
             else:
                 match_idx = find_a_matched_line(pidx, pline[1:].lstrip(), code_lines, patch_lines, lag=replace_idx, existing=True)
                 if match_idx > 0:
@@ -124,7 +141,8 @@ def patching(patch: str, raw_code_lines: list[str]) -> str: # return patched cod
                 if post_valid is not None:
                     unique_idx = find_a_matched_line(post_valid[0], post_valid[1], code_lines, patch_lines, lag=replace_idx)
                     if unique_idx >= 0:
-                        patched[unique_idx] = [pline[1:].rstrip(), patched[unique_idx]]
+                        existing_val = patched[unique_idx] if isinstance(patched[unique_idx], list) else [patched[unique_idx]]
+                        patched[unique_idx] = [pline[1:].rstrip()] + existing_val
                         replace_idx, pre_patch_idx = unique_idx, pidx
                         continue
                 # Cannot find neibors
@@ -199,16 +217,6 @@ def _find_gradle() -> str:
 def patching_and_testing_quixbugs(patch: str, project_meta: dict) -> bool:
     quixbugs_repo = project_meta["quixbugs_repo"]
     program_name = project_meta["project_name"]
-    src_file = os.path.join(quixbugs_repo, "java_programs", f"{program_name}.java")
-
-    with open(src_file, encoding="utf-8") as f:
-        original = f.read()
-
-    try:
-        patched_code = patching(patch, original.splitlines())
-    except (NoCodeError, NotPatchError) as e:
-        logging.warning(f"Cannot patch: {e}")
-        return None
 
     test_class = f"java_testcases.junit.{program_name}_TEST"
     try:
@@ -217,9 +225,32 @@ def patching_and_testing_quixbugs(patch: str, project_meta: dict) -> bool:
         logging.error(str(e))
         return None
 
+    # Resolve file(s) to patch
+    hunks = split_multi_file_patch(patch)
+    if not hunks:
+        # Single-file patch without diff --git header — use the primary program file
+        hunks = {f"java_programs/{program_name}.java": patch}
+
+    originals = {}
     try:
-        with open(src_file, "w", encoding="utf-8") as f:
-            f.write(patched_code)
+        for rel_path, hunk in hunks.items():
+            # Resolve to an absolute path in the quixbugs repo
+            candidate = os.path.join(quixbugs_repo, rel_path)
+            if not os.path.exists(candidate):
+                candidate = os.path.join(quixbugs_repo, "java_programs", os.path.basename(rel_path))
+            if not os.path.exists(candidate):
+                logging.warning(f"Cannot find file for hunk: {rel_path}")
+                continue
+            with open(candidate, encoding="utf-8") as f:
+                originals[candidate] = f.read()
+            try:
+                patched_code = patching(hunk, originals[candidate].splitlines())
+            except (NoCodeError, NotPatchError) as e:
+                logging.warning(f"Cannot patch {rel_path}: {e}")
+                continue
+            with open(candidate, "w", encoding="utf-8") as f:
+                f.write(patched_code)
+
         result = subprocess.run(
             [gradle_bin, "test", "--tests", test_class, "--rerun-tasks"],
             cwd=quixbugs_repo,
@@ -231,28 +262,19 @@ def patching_and_testing_quixbugs(patch: str, project_meta: dict) -> bool:
         logging.warning(f"Gradle test timed out for {program_name}")
         return None
     finally:
-        with open(src_file, "w", encoding="utf-8") as f:
-            f.write(original)
+        for path, original in originals.items():
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(original)
 
 
 def patching_and_testing_bears(patch: str, project_meta: dict) -> bool:
     """Apply patch, run mvn test on the Bears checkout, restore original."""
     import xml.etree.ElementTree as ET
 
-    buggy_file = project_meta["buggy_file_path"]
     checkout_dir = os.path.join(
         project_meta["checkout_dir"],
         f"{project_meta['bug_name']}_buggy",
     )
-
-    with open(buggy_file, encoding="utf-8") as f:
-        original = f.read()
-
-    try:
-        patched_code = patching(patch, original.splitlines())
-    except (NoCodeError, NotPatchError) as e:
-        logging.warning(f"Cannot patch: {e}")
-        return None
 
     # Derive failing test class names from failing_tests file
     failing_tests_path = os.path.join(checkout_dir, "failing_tests")
@@ -269,13 +291,33 @@ def patching_and_testing_bears(patch: str, project_meta: dict) -> bool:
     if test_classes:
         cmd += [f"-Dtest={'+'.join(test_classes)}", "-DfailIfNoTests=false"]
 
+    # Resolve file(s) to patch
+    hunks = split_multi_file_patch(patch)
+    if not hunks:
+        hunks = {os.path.relpath(project_meta["buggy_file_path"], checkout_dir): patch}
+
+    originals = {}
     try:
-        with open(buggy_file, "w", encoding="utf-8") as f:
-            f.write(patched_code)
+        for rel_path, hunk in hunks.items():
+            candidate = os.path.join(checkout_dir, rel_path)
+            if not os.path.exists(candidate):
+                candidate = project_meta["buggy_file_path"]
+            if not os.path.exists(candidate):
+                logging.warning(f"Cannot find file for hunk: {rel_path}")
+                continue
+            with open(candidate, encoding="utf-8") as f:
+                originals[candidate] = f.read()
+            try:
+                patched_code = patching(hunk, originals[candidate].splitlines())
+            except (NoCodeError, NotPatchError) as e:
+                logging.warning(f"Cannot patch {rel_path}: {e}")
+                continue
+            with open(candidate, "w", encoding="utf-8") as f:
+                f.write(patched_code)
+
         result = subprocess.run(cmd, cwd=checkout_dir, capture_output=True, timeout=600)
         if result.returncode != 0:
             return False
-        # Double-check via surefire XML: any <failure> elements?
         for root_dir, _, files in os.walk(os.path.join(checkout_dir, "target", "surefire-reports")):
             for fname in files:
                 if not (fname.startswith("TEST-") and fname.endswith(".xml")):
@@ -291,6 +333,103 @@ def patching_and_testing_bears(patch: str, project_meta: dict) -> bool:
         logging.warning(f"Maven test timed out for {project_meta['bug_name']}")
         return None
     finally:
+        for path, original in originals.items():
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(original)
+
+
+def _find_java11() -> Optional[str]:
+    """Return a JAVA_HOME path for Java 11 if one is installed, else None."""
+    try:
+        r = subprocess.run(
+            ["/usr/libexec/java_home", "-v", "11"],
+            capture_output=True, timeout=10,
+        )
+        if r.returncode == 0:
+            return r.stdout.decode("utf-8").strip()
+    except FileNotFoundError:
+        pass
+    candidates = [
+        "/opt/homebrew/opt/openjdk@11",
+        "/usr/local/opt/openjdk@11",
+        "/usr/lib/jvm/java-11-openjdk-arm64",
+        "/usr/lib/jvm/java-11-openjdk-amd64",
+    ]
+    for path in candidates:
+        if os.path.isdir(path):
+            return path
+    return None
+
+
+def _find_d4j_bin() -> str:
+    """Return the defects4j binary path, checking tools/defects4j first then PATH."""
+    import shutil
+    local = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "..", "defects4j", "framework", "bin", "defects4j",
+    )
+    if os.path.exists(local):
+        return local
+    found = shutil.which("defects4j")
+    return found if found else "defects4j"
+
+
+def patching_and_testing_d4j(patch: str, project_meta: dict) -> bool:
+    """Apply patch, run defects4j compile+test locally (no Docker), restore original."""
+    buggy_file = project_meta["buggy_file_path"]
+    checkout_dir = os.path.join(
+        project_meta["checkout_dir"],
+        f"{project_meta['bug_name']}_buggy",
+    )
+
+    with open(buggy_file, encoding="utf-8") as f:
+        original = f.read()
+
+    try:
+        patched_code = patching(patch, original.splitlines())
+    except (NoCodeError, NotPatchError) as e:
+        logging.warning(f"Cannot patch: {e}")
+        return None
+
+    env = os.environ.copy()
+    java11 = _find_java11()
+    if java11:
+        env["JAVA_HOME"] = java11
+        env["PATH"] = os.path.join(java11, "bin") + os.pathsep + env.get("PATH", "")
+    perl5_lib = os.path.join(os.path.expanduser("~"), "perl5", "lib", "perl5")
+    if os.path.isdir(perl5_lib):
+        existing = env.get("PERL5LIB", "")
+        env["PERL5LIB"] = perl5_lib + (os.pathsep + existing if existing else "")
+    d4j_bin = _find_d4j_bin()
+
+    try:
+        with open(buggy_file, "w", encoding="utf-8") as f:
+            f.write(patched_code)
+
+        compile_res = subprocess.run(
+            [d4j_bin, "compile"], cwd=checkout_dir,
+            capture_output=True, env=env, timeout=120,
+        )
+        compile_out = compile_res.stdout.decode("utf-8", errors="replace")
+        if compile_res.returncode != 0 or "BUILD FAILED" in compile_out:
+            logging.warning(f"Compile failed for {project_meta['bug_name']}")
+            return False
+
+        test_res = subprocess.run(
+            [d4j_bin, "test"], cwd=checkout_dir,
+            capture_output=True, env=env, timeout=300,
+        )
+
+        test_out = test_res.stdout.decode("utf-8", errors="replace")
+        m = re.search(r"Failing tests:\s*(\d+)", test_out)
+        if m:
+            return int(m.group(1)) == 0
+        logging.error(f"Cannot parse test output:\n{test_out}")
+        return None
+    except subprocess.TimeoutExpired:
+        logging.warning(f"Test timed out for {project_meta['bug_name']}")
+        return None
+    finally:
         with open(buggy_file, "w", encoding="utf-8") as f:
             f.write(original)
 
@@ -300,6 +439,8 @@ def patching_and_testing(patch: str, project_meta: dict, container_id='7bdc33a65
         return patching_and_testing_quixbugs(patch, project_meta)
     if project_meta.get("data_name") == "bears":
         return patching_and_testing_bears(patch, project_meta)
+    if project_meta.get("data_name") == "d4j":
+        return patching_and_testing_d4j(patch, project_meta)
 
     import docker
     client = docker.from_env()

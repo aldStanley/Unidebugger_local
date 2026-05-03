@@ -1,9 +1,11 @@
 import os
+import logging
 from retry import retry
 from utils import read_yaml
 from agents.agent import Agent, RetryError
 from prompts.tokens import *
 from collections import defaultdict
+from myast import extract_method_stubs
 
 
 class Summarizer(Agent):
@@ -38,8 +40,11 @@ class Summarizer(Agent):
     def run(self, code):
         logging.info("## Running Summarizer...")
         self.prompts_dict = read_yaml(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../prompts/summarizer.yaml"))
-        
+
+        stubs = extract_method_stubs(code)
+        logging.info(f"Summarizer: {calculate_token(code)} → {calculate_token(stubs)} tokens after stub extraction")
+
         return self.parse_response(self.send_message([
                 {"role": "system", "content": self.prompts_dict["sys"]},
-                {"role": "user", "content": "Raw Code:\n" + code + "\n" + self.prompts_dict["end"]}])
+                {"role": "user", "content": "Raw Code:\n" + stubs + "\n" + self.prompts_dict["end"]}])
         )

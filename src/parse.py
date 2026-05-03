@@ -58,7 +58,8 @@ def exist_line(line, mylst):
     return False
 
 def is_valid_line(line, lenth=0):
-    return len(remove_whitespace(line)) > lenth and line.strip()[0] != "+" and "missing" not in line and "buggy" not in line
+    stripped = line.strip()
+    return len(remove_whitespace(line)) > lenth and len(stripped) > 0 and stripped[0] != "+" and "missing" not in line and "buggy" not in line
 
 def search_valid_line(lines: list[str], start_idx: int, mode, degree=1, existing=None): # Valid: Not a edited or empty line
     incre = -1 if mode == "pre" else 1

@@ -19,7 +19,8 @@ sys:
                 5) why you make such changes and how tracking key parameters guide your revisions.\n\n\
               ## Constrains\n\
               - Patch must be in correct git diff format, enclosed within three backticks (```)\n\
-              - Patch is used for fixing the buggy code, not the testing cases
+              - Patch is used for fixing the buggy code, not the testing cases\n\
+              - If the bug spans multiple files, return one diff hunk per file, each in its own three backticks (```)\n\
               - Explanation must be clear and relevant to the bug analysis and fix, enclosed within three equal signs (===)\n\n\
               ## Example\n\
               #### Input\n\
@@ -84,6 +85,7 @@ sys:
               - Return a brief explaination on how tracking key parameter values guide your revisions\n\n\
               ## Constrains\n\
               - Patch must be in correct git diff format, enclosed within three backticks (```)\n\
+              - If the bug spans multiple files, return one diff hunk per file, each in its own three backticks (```)\n\
               - Explanation must be clear and relevant to the bug analysis and fix, enclosed within three equal sign (===)\n\n\
               ## Example\n\
               #### USER'S INPUT\n\

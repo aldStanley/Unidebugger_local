@@ -28,7 +28,7 @@ class Helper(Agent):
             self.__generate_core_msg(info)
 
         repo_path = info["project_meta"].get("project_src_path", info["project_meta"]["checkout_dir"])
-        rag = LocalRAG(repo_path)
+        rag = LocalRAG(repo_path, openai_client=self.client)
         rag.build_index()
         context_text, top_entries = rag.query(info["buggy_code"], top_k=5)
         logging.info(f"## LocalRAG: indexed {len(rag.index)} symbols, retrieved {len(top_entries)} top entries")

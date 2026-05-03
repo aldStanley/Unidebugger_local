@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+import json
 import openai
 import google.generativeai as genai
 import logging
@@ -132,6 +133,25 @@ class Agent(ABC):
             response = self.client.generate_content(self.__dict_prompt_to_text(msg))
             if handling: return self.__handle_gemini_response(response)
             else: return response
+
+    def _tool_loop(self, messages: list, tools: list, tool_handler) -> str:
+        """Send messages, handle all tool calls in a loop, return final text response."""
+        while True:
+            response = self.send_message(messages, tools=tools, handling=False)
+            if hasattr(response, "usage") and response.usage:
+                self.usage["prompt_tokens"] += response.usage.prompt_tokens
+                self.usage["completion_tokens"] += response.usage.completion_tokens
+            if response.choices[0].finish_reason != "tool_calls":
+                return response.choices[0].message.content
+            messages.append(response.choices[0].message)
+            for tool_call in response.choices[0].message.tool_calls:
+                args = json.loads(tool_call.function.arguments)
+                result = tool_handler(tool_call.function.name, args)
+                messages.append({
+                    "role": "tool",
+                    "content": str(result),
+                    "tool_call_id": tool_call.id,
+                })
 
     @abstractmethod
     def parse_response(self, response: str, *args):
